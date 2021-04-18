@@ -1,0 +1,206 @@
+---
+title: "Market Shed"
+author: "Yanbing Yi"
+date: "4/16/2021"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+## Introduction
+
+This report aims to calculate the local food shed by the market population and the local crop consumption rate. There are two parts in this report. The first part will calculate the market population based on market location and population density. The second part will clean and aggregate crop production and supply data. At the end of the report, we will have the local food for each market.
+
+
+The market location was obtained from the `Geocoding` report, and the area of each market is defined as a 20-km-radii circle around the market point. [Population data](http://sedac.ciesin.columbia.edu/data/collection/gpw-v4/documentation) is available on Socioeconomic Data and Applications Center (sedac). Data is presented in raster format and was measured every 5 years. Here, we use the data from 2000 to 2015, which covered the time period from 2000 to 2019. Crop production and supply information is available on the [FAO website](http://www.fao.org/faostat/en/#data/FBS). We will only use data from 2000 to 2019. If data is not available in a particular year, we will leave it as `NA`. The final local food shed is calculated as the median of all available data of each market. 
+
+
+
+## Market Population
+
+```{r}
+library(sf)
+library(raster)
+library(rgdal)
+library(tidyverse)
+library(exactextractr)
+
+## Market address we found from "geocoding"
+Market <- read.csv("output/Market_Address.csv")
+
+## Convert into point feature
+projargs <- "+proj=longlat +datum=WGS84"
+Market.sp <- SpatialPoints(coords = data.frame(Market$longitude, Market$latitude), 
+                           proj4string = CRS(projargs))
+Market.spdf = SpatialPointsDataFrame(Market.sp, data = Market, match.ID = T)
+
+## View the markets
+boundary <- readOGR("data/World_Countries_Boundaries/99bfd9e7-bb42-4728-87b5-07f8c8ac631c2020328-1-1vef4ev.lu5nk.shp")
+plot(boundary, border = "grey70")
+plot(Market.spdf, pch = 16, col = "darkblue", cex = 0.6, add = T)
+box()
+```
+
+```{r}
+## Population raster 
+pop2000 <- raster("data/population/gpw_v4_population_count_rev11_2000_30_sec.tif")
+pop2005 <- raster("data/population/gpw_v4_population_count_rev11_2005_30_sec.tif")
+pop2010 <- raster("data/population/gpw_v4_population_count_rev11_2010_30_sec.tif")
+pop2015 <- raster("data/population/gpw_v4_population_count_rev11_2015_30_sec.tif")
+
+## Buffer around market 
+buff.mkt <- buffer(Market.sp, width = 20000, dissolve = F)
+buff.sf <- st_as_sf(buff.mkt)
+
+pop.list <- list(pop2000, pop2005, pop2010, pop2015)
+```
+
+
+```
+#' Zonal Statistics
+#'
+#' @param raster        Raster data which contains values in each cell
+#'
+#' @param area.sp       Shapefile will define the area of the zone that information 
+#'                      will be calculated
+#' @param fun           Type of the output statistics
+#'
+#' @return              Vector of values for each features in the shapefile
+#'
+```
+
+```{r}
+zonal.stat <- function(raster, area.sp = buff.sf, fun = "sum"){
+  exact_extract(x = raster, y = area.sp, fun=fun)
+}
+```
+
+
+```{r, results=FALSE}
+## Calculate zonal statistics for each population raster
+mkt.pop <- sapply(pop.list, FUN=zonal.stat)
+colnames(mkt.pop) <- c("pop2000", "pop2005", "pop2010", "pop2015")
+
+Market.population <- Market %>% bind_cols(data.frame(mkt.pop))
+
+## Convert market population from wide format to long format
+Mkt.pop.long <- Market.population %>% gather(Year.code, Population, 10:13)
+Mkt.pop.long$Year.code <- as.numeric(str_sub(Mkt.pop.long$Year.code, start = 4))
+head(Mkt.pop.long)
+```
+
+
+## Local Consumption
+
+```{r}
+FAO <- read.csv("data/FAOSTAT_data_10-26-2019.csv")
+FAO$ISO3 <- as.character(FAO$ISO3)
+```
+
+
+```
+#' Extract the desired information from FAO data
+#'
+#' @param info.type       Name of the infomation type. Options: "Production", 
+#'                        "Domestic Supply", "Food Supply"
+#' @param crop.type       Name of the desired crop type. Options: "Maize", "Wheat", "Rice"
+#'
+#' @return                Dataframe contains the ISO3, Year, and desired value
+#'
+```
+
+```{r}
+crop.info <- function(info.type, crop.type){
+  element_code <- case_when(info.type == "Production" ~ 5511,
+                            info.type == "Domestic Supply" ~ 5301,
+                            info.type == "Food Supply" ~ 645)
+  item_code <- case_when(crop.type == "Maize" ~ 2514,
+                         crop.type == "Wheat" ~ 2511,
+                         crop.type == "Rice" ~ 645)
+  FAO %>% 
+    filter(`Element.Code` == element_code, `Item.Code` == item_code) %>% 
+    select(ISO3, Value, Year)
+}
+
+```
+
+
+```{r}
+## Extract "Production", "Domestic Supply", and "Food Supply" from FAO data
+maize.prod <- crop.info(info.type = "Production", crop.type = "Maize")
+colnames(maize.prod)[2] <- "Production"
+maize.dom.sup <- crop.info(info.type = "Domestic Supply", crop.type = "Maize")
+colnames(maize.dom.sup)[2] <- "Dom_Sup"
+maize.food.sup <- crop.info(info.type = "Food Supply", crop.type = "Maize")
+colnames(maize.food.sup)[2] <- "Food_Sup"
+
+## Check the year range of the records
+range <- range(maize.prod$Year)
+range
+```
+
+
+Since the crop production and supply information was missing for some important country, we will estimate the production and supply using the information from nearby countries. The estimation method for **Burundi**, **Eritrea**, and **Somalia** as followed:
+
+* For Burundi(BDI) - use the average local consumption of Rwanda(RWA)
+* For Eritrea(ERI) - use the average local consumption of Ethiopia(ETH)
+* For Somalia(SOM) - use the average local consumption of Ethiopia(ETH) and Kenya(KEN)
+
+
+```{r}
+## Estimate values for BDI, ERI, and SOM
+BDI.prod <- mean(maize.prod$Production[maize.prod$ISO3 == "RWA"], na.rm = T)
+BDI.dom_sup <- mean(maize.dom.sup$Dom_Sup[maize.dom.sup$ISO3 == "RWA"], na.rm = T)
+BDI.food_sup <- mean(maize.food.sup$Food_Sup[maize.food.sup$ISO3 == "RWA"], na.rm = T)
+
+ERI.prod <- mean(maize.prod$Production[maize.prod$ISO3 == "ETH"], na.rm = T)
+ERI.dom_sup <- mean(maize.dom.sup$Dom_Sup[maize.dom.sup$ISO3 == "ETH"], na.rm = T)
+ERI.food_sup <- mean(maize.food.sup$Food_Sup[maize.food.sup$ISO3 == "ETH"], na.rm = T)
+
+SOM.prod <- (mean(maize.prod$Production[maize.prod$ISO3 == "ETH"], na.rm = T) + 
+               mean(maize.prod$Production[maize.prod$ISO3 == "KEN"], na.rm = T))/2
+SOM.dom_sup <- (mean(maize.dom.sup$Dom_Sup[maize.dom.sup$ISO3 == "ETH"], na.rm = T) + 
+                  mean(maize.dom.sup$Dom_Sup[maize.dom.sup$ISO3 == "KEN"], na.rm = T))/2
+SOM.food_sup <- (mean(maize.food.sup$Food_Sup[maize.food.sup$ISO3 == "ETH"], na.rm = T) +
+                   mean(maize.food.sup$Food_Sup[maize.food.sup$ISO3 == "KEN"], na.rm = T))/2
+```
+
+
+
+```{r}
+## Calculate local food shed
+Market.con <- map_dfr(seq_len(5), ~Mkt.pop.long)
+
+Market.con <- Market.con %>% 
+  arrange(ID, Year.code) %>% 
+  mutate(Year = rep(seq(from = 2000, to = 2019), length(ID)/20)) %>% 
+  left_join(maize.prod, by = c("ISO3", "Year")) %>% 
+  left_join(maize.dom.sup, by = c("ISO3", "Year")) %>% 
+  left_join(maize.food.sup, by = c("ISO3", "Year")) %>% 
+  mutate(Production = replace(Production, ISO3 == "BDI", BDI.prod),
+         Production = replace(Production, ISO3 == "ERI", ERI.prod),
+         Production = replace(Production, ISO3 == "SOM", SOM.prod),
+         Dom_Sup = replace(Production, ISO3 == "BDI", BDI.dom_sup),
+         Dom_Sup = replace(Production, ISO3 == "ERI", ERI.dom_sup),
+         Dom_Sup = replace(Production, ISO3 == "SOM", SOM.dom_sup),
+         Food_Sup = replace(Production, ISO3 == "BDI", BDI.food_sup),
+         Food_Sup = replace(Production, ISO3 == "ERI", ERI.food_sup),
+         Food_Sup = replace(Production, ISO3 == "SOM", SOM.food_sup)) %>% 
+  mutate(Local_com = case_when(Production/Dom_Sup > 1 ~ 1, T ~ Production/Dom_Sup),
+         Mkt_com = Local_com*Food_Sup*Population) %>% 
+  group_by(ID) %>% 
+  summarise(local_consumption = median(Mkt_com, na.rm = TRUE))
+```
+
+
+```{r}
+## Final data
+Market.info <- Market %>% left_join(Market.con, by = "ID")
+write.csv(Market.info, file = "output/FoodShed.csv")
+```
+
+

@@ -1,0 +1,168 @@
+---
+title: "Geocoding Market Coordinates"
+author: "Yanbingyi"
+date: "2021-04-15"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+## Introduction
+
+This report uses the names and the address of markets that were contained in the food price data from Global Food Prices Database [(WFP)](https://data.humdata.org/dataset/wfp-food-prices) to geocode their coordinates in longitude and latitude. The geocoding service that used in this report is provided by Google Map. To facilitate the future analysis, each market will be matched to its country code (ISO3) and will be assigned to a unique market ID. At the end of the report, a csv file that included the market names, address, ISO3, coordinates, and unique market ID will be created. A point shapefile will also be created for visualization and further analysis.
+
+
+## Geocode Market Location
+
+```{r}
+library(tidyverse)
+## Read data
+wfp_foodprice <- read.csv("data/wfpvam_foodprices.csv")
+
+## Extract market names and address
+market.address <- wfp_foodprice %>% 
+  select(adm0_name, adm1_name, mkt_name) %>% 
+  mutate(mkt_country = paste(mkt_name, adm0_name, sep = ", "),
+         mkt_province = paste(mkt_name, adm1_name, sep = ", ")) %>% 
+  distinct(mkt_country, mkt_province, .keep_all = T)
+```
+
+```{r}
+library(ggmap)
+```
+
+
+```{r include=FALSE}
+# Set API key
+register_google("AIzaSyDOnGSpn3jCOvFBxA-4cywo4oD-NdEpseU")
+```
+
+
+```{r}
+## Set API key
+## register_google("API")
+## Geocoding by market name+country
+Coord <- market.address %>% 
+  mutate_geocode(mkt_country)
+
+## Some markets can't be located by market name+country 
+## Try market name+province
+Coord.missing <- Coord %>% 
+  filter(is.na(lon)) %>% 
+  select(-lon, -lat) %>% 
+  mutate_geocode(mkt_province) 
+
+## Combine two dataframe
+Address <- Coord %>% 
+  left_join(Coord.missing, by = c("adm0_name", "adm1_name", "mkt_name", "mkt_country", "mkt_province")) %>% 
+  mutate(longitude = case_when(is.na(lon.x) ~ lon.y, T ~ lon.x),
+         latitude = case_when(is.na(lat.x) ~ lat.y, T ~ lat.x)) %>% 
+  select(-lon.x, -lon.y, -lat.x, -lat.y)
+
+## Markets can't be located
+Missing <- Address %>% filter(is.na(longitude))
+nrow(Missing)
+head(Missing)
+```
+
+Since we can't locate these markets in map, these markets will not be included in future analysis
+
+
+## Match with ISO3 and assign market ID
+
+```{r}
+ISO3 <- read.csv("data/COUNTRY CODE.csv")
+colnames(ISO3)[1] <- "Country"
+colnames(Address)[1] <- "Country"
+
+Address <- Address %>% 
+  left_join(ISO3, by = "Country")
+
+## Manually enter the ISO3 for markets can't be matched
+## this is because some countries have different names 
+ISO3.missing <- Address %>% 
+  filter(is.na(`Alpha.3.code`)) %>% 
+  select(Country, `Alpha.3.code`) %>% 
+  distinct()
+ISO3.missing
+```
+
+
+The current officially assigned ISO 3166-1 alpha-3 codes and their corresponding country names can be found [here](https://unstats.un.org/unsd/tradekb/Knowledgebase/50347/Country-Code)
+
+
+```{r}
+ISO3.missing$Alpha.3.code <- c("IND", "CIV", "COD", "IRN", "MDA", "SSD", "PSE", "TZA")
+
+Address <- Address %>% 
+  filter(!is.na(longitude)) %>% 
+  mutate(ISO3 = as.character(Alpha.3.code)) %>% 
+  select(-Alpha.3.code) %>% 
+  left_join(ISO3.missing, by = "Country") 
+
+Address$ISO3[is.na(Address$ISO3)] <- Address$Alpha.3.code[is.na(Address$ISO3)]
+
+## Final result
+Mkt_info <- Address %>% 
+  select(ISO3, Country, Province = adm1_name, Market = mkt_name, Address = mkt_country, latitude, longitude)
+
+```
+
+There are a few previously geocoded markets. We will combine the old list to our new list
+
+```{r}
+old.list <- read.csv("data/market_coord.csv")
+head(old.list)
+
+old.list <- old.list %>% 
+  left_join(ISO3, by = c("ISO" = "Alpha.3.code"))
+
+## Check if there is any issue with the country name
+old.list[is.na(old.list$Country),]
+
+## "SSD" is South Sudan
+##  We will manually fill in the country name
+old.list$Country <- as.character(old.list$Country)
+old.list$Country[old.list$ISO == "SSD"] <- "South Sudan"
+
+Coord.old <- old.list %>% 
+  select(ISO3 = ISO, Country, Market = MARKET) %>% 
+  mutate(Address = paste(Market, Country, sep = ", ")) %>% 
+  mutate_geocode(Address)
+
+## Check if there is any geocoding issue
+Coord.old[is.na(Coord.old$lat), ]
+
+## Will remove this observation
+Coord.old <- Coord.old %>% 
+  filter(!is.na(lon)) %>% 
+  mutate(Province = NA) %>% 
+  select(ISO3, Country, Province, Market, Address, latitude = lat, longitude = lon)
+```
+
+
+```{r}
+## Combine two dataframe
+## Some markets in the old list are overlapped with the new list
+## We will only keep one observation if duplicated
+remove.dup <- data.frame(lat = Coord.old$latitude, lon = Coord.old$longitude, lat.check = NA, lon.check = NA)
+remove.dup$lat.check <- remove.dup$lat %in% Mkt_info$latitude
+remove.dup$lon.check <- remove.dup$lon %in% Mkt_info$longitude
+
+Mkt_info <- Mkt_info %>% 
+  bind_rows(Coord.old[(remove.dup$lat.check + remove.dup$lon.check) == 0,]) %>% 
+  arrange(Country, Province, Market) %>% 
+  mutate(ID = paste0(ISO3, seq(length(Country))))
+
+```
+
+
+```{r}
+write.csv(Mkt_info, file = "output/Market_Address.csv")
+```
+
